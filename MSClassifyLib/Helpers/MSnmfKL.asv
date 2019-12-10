@@ -1,0 +1,469 @@
+function [K,X,param,stats] = MSnmfKL(Y,p,stopcrit)
+%non-negative matrix factorization with Kullback-Leibler discrepancy term
+%and penalty terms
+
+%according to C. De Mol and L. Lecharlier and own ongoing research
+
+%Given a data matrix Y, nmfKL aims to find 2 non-negative low-rank matrices
+%K and X, such that Y~K*X, while at the same time penalty terms allow a 
+%trade-off  between some (unknown) optimal non-negative low-rank 
+%approximation and additional desired properties like smoothness or
+%sparsity. Usually Y contains noise and implicitely (K,X) already 
+%approximate the unknown true Ytrue. It can be shown that minimizing the 
+%l2-norm ||Y-K*X|| is equivalent to the determination of an MAP-estimator
+%in the presence of additive gaussian noise. Without the positivity 
+%constraint it can be shown that PCA (principal component analysis) is the
+%optimal way to tackle the problem. Similarly, minimizing the
+%so-called Kullback-Leibler divergence (KL) corresponds to Poisson noise
+%(not additive!). In our case Poisson noise seems to be closer to reality
+%than gaussian noise, which is why we opt for the former.
+
+%The algorithm is an iterative, multiplicative algorithm. After an initial
+%guess, K and X are updated alternatingly. In the case of gaussian noise it
+%can be shown that this procedure is equivalent to a gradient descent
+%(respective to K or X as a variable, not both) with a special step size.
+
+%In applications (e.g. in the context of hyperspectral data) often times
+%K and X can be treated as directly interpretable features of the data set.
+%They span a k-dimensional subspace (to be more exact a k-simplex)
+%and approximate any observation in Y (i.e. any column or row) as a
+%positive linear combination. For sparse data, the fact that only positive 
+%linear combinations are allowed typically results in sparse basic features
+%in K (column-wise) and in X (row-wise) which can be seen as sparse basic 
+%modules. This offers special benefits in the context of bioinformatics.
+
+%--------------------------------------------------------------------------
+
+%Input:
+%------
+%Y:     data matrix, size: n*m
+%p:     dimension parameter (number of features to look for, rank of K*X),
+%       typically p<<min(m,n), e.g. 5<=p<=20, there exist possibilities to
+%       estimate a good choice for p (AIC, Akaike information criterion,
+%       BIC, bayesian information criterion)
+%stopcrit: stopping criterion, default (if none is given) is 'iterates' 
+%       which stops the iterations after 
+%       ||K^(t+1)-K^t|| / ||K^t||  +  ||X^(t+1)-X^t|| / ||X^t|| 
+%               < param.stoplim,
+%       it is also possible to set stopcrit = n where n is an integer >=0
+%       manually specifying the number of iterations (real values are
+%       rounded up to the next integer)
+
+
+%Output:
+%-------
+%K:     left output matrix, size: n*p
+%X:     right output matrix, size: p*m
+%param: struct with information about the parameters
+%stats: struct with stats about the calculation and outcome
+
+% This code is kindly provided by the author for research purposes.
+% (Delf Lachmund, university of Bremen, germany.)
+% For any problems or questions please send an email to
+% delf@math.uni-bremen.de
+
+%--------------------------------------------------------------------------
+
+%--------------------------------------------------------------------------
+%1.) Defining parameters in struct param
+[rows, columns]=size(Y);
+param.init = 'svdbased';
+%possibilities:
+%--------------------
+%'svdbased' - compare publication of Boutsidis and Gallopoulus [2008]
+%'random' - absolute of gaussian random distributed initial matrices
+%'manual' - looking for matrices K and X in the workspace and taking them
+%as initialization matrices
+
+%parameters and their interpretation for row-wise MALDI-imaging data Y
+%(mass spectrometry)
+param.lambda    = 10^(-1); %sparsity of spectra
+param.mu        = 10^(-6); %smoothness of images
+param.nu        = 10^(-9); %smoothness of spectra
+param.omega     = 10^(-9); %sparsity of images
+param.eps_stab  = 10^(-50); %stability of sparsity in K and X,
+%"sparsity limit" is eps_stab>0 instead of 0
+param.minit     = 10; %min. number of iterations
+param.maxit     = 100; %max. number of iterations
+param.rctevl    = 8; %remaining calc. time estimation vector length:
+%that many last iterates are used for the estimation of remaining calc. 
+%time (in case of 'iterates' stopping criterion).
+param.rctevsl   = 2; %remaining calc- time estimation vector skip length
+param.stoplim   = 5.0*10^(-3); %limit determining when to stop, stopping 
+%when relative frobeniusnorm changes in K and X go below stoplim
+
+%--------------------------------------------------------------------------
+%2.) Defining multiple used smaller functions in function handles
+
+%function handle of the frobenius of the difference of 2 matrices
+normfro = @(X1,X2)sqrt(sum(sum(X1-X2).^2)); %faster than matlab's norm for 
+                                            %some reason
+%handle of cost functional to minimize
+cfunctional = @(Y,K,X)(sum(sum(max(0,Y.*log((Y+param.eps_stab)./(K*X))...
+    -Y+K*X)))+param.lambda*sum(X(:))+param.mu/2*sum(sum(K.*K))+...
+    param.nu/2*sum(sum(X.*X)))+param.omega*sum(K(:));
+format compact;
+
+%--------------------------------------------------------------------------
+%3.) Starting the timer and checking if stopping criterion is well defined
+
+timestarted0 = clock;
+if nargin<3 || strcmp(stopcrit,'iterates')
+    stopcrit = 'iterates';
+    rctev = zeros(param.rctevl,1); %will be used to estimate remaining 
+                                %calculation time
+    rdelta_it = @(K,K2,X,X2)(normfro(K,K2)/normfro(K2,0)+...
+        normfro(X,X2)/normfro(X2,0));
+    fprintf(['Going to use stopping criterion based on difference ',...
+        'of iterates.\n']);
+elseif isnumeric(stopcrit) && length(stopcrit)==1 && stopcrit>=0
+    numberit = stopcrit;
+    stopcrit = 'manual';
+    fprintf('Going to use manual stopping criterion.\n');
+    if numberit > param.maxit
+        numberit = param.maxit;
+        fprintf(['Number of iterations is set to max. number of ',...
+           'iterations,\n for more iterations change maxit in the code.']);
+    end
+else
+    error('Unknown stopping criterion.\n');
+end
+param.stopcrit = stopcrit;
+
+%--------------------------------------------------------------------------
+%4.) Initializing K and X
+
+%---------------
+Y = double(Y);  % increasing numerical robustness significantly!
+%                 should only be removed if there are memory issues!
+%---------------
+
+[n,m]=size(Y);
+if strcmp(param.init,'manual')
+    fprintf(['Reading in existing matrices K and X from the ',...
+        'workspace and using them as initialization matrices.\n']);
+    K0 = evalin('base','K');
+    X0 = evalin('base','X');
+elseif strcmp(param.init,'random')
+    fprintf('Determining a random initialization.\n');
+    rng(42);
+    K0 = abs(randn(n,p))+eps;
+    X0 = abs(randn(p,m))+eps;
+    fprintf('Trying to optimize a scaling factor k s. t. k*K0*k*X0~Y:\n');
+    %There is an analytical solution for the optimal scaling factor:
+    k_analytical=sqrt(sum(sum(Y.*(K0*X0)))/sum(sum((K0*X0).^2)));
+    if k_analytical<=0 || k_analytical>1
+        fprintf('Warning: k_analytical not in [0,1].\n');
+    end
+    fprintf('Calculated factor: k_analytical=%6.4f\n',k_analytical); 
+    K0=k_analytical*K0;
+    X0=k_analytical*X0;
+    stats.relapproxerrorfro_init = normfro(Y,K0*X0)/normfro(Y,0);
+    fprintf('Rel. error ||Y-KX||/||Y||:    %10.8g\n',...
+    stats.relapproxerrorfro_init);
+    stats.relcfunctional_init = cfunctional(Y,K0,X0)/(normfro(Y,0)).^2;
+    fprintf('Rel. C-value for init. (K,X): %10.8g\n',...
+        stats.relcfunctional_init);
+elseif strcmp(param.init,'svdbased')
+    fprintf('Calculating an svd based initialization.\n');
+    fprintf('Taking use of a fast svd variant.\n');
+    rng(42);
+    tic; 
+    if min(size(Y,1),size(Y,2))<200
+        [U,S,V] = svd(Y);
+    else
+        [U,S,V] = fsvd(Y,min(2*p,min(size(Y,1),size(Y,2))),1,0); %randomization errors become larger for the 
+    end
+
+    %last calculated svd-vectors depending on the dimension parameter p, 
+    %a general recommendation is to calculate a fast svd for
+    %roughly 1.5*p vectors and only take the first p calculated vectors.
+    %Here, we choose 2*p instead of p.
+    toc;     
+    K0 = zeros(n,p);
+    X0 = zeros(p,m);
+    K0(:,1) = sqrt(S(1,1))*abs(U(:,1));         
+    X0(1,:) = sqrt(S(1,1))*abs(V(:,1)'); 
+    %for the following compare the publication of Boutsidis/Gallopoulos:
+    %SVD based initialization: A head start for nonnegative matrix
+    %factorization, in Pattern Recognition 41 (2008), 1350-1362
+    posf = @(X)(X>=0).*X;
+    negf = @(X)(X<0).*(-X);
+    for j=2:p
+        uu = U(:,j); vv = V(:,j);
+        uup = posf(uu); uun = negf(uu) ;
+        vvp = posf(vv); vvn = negf(vv);
+        n_uup = norm(uup);
+        n_vvp = norm(vvp) ;
+        n_uun = norm(uun) ;
+        n_vvn = norm(vvn) ;
+        termp = n_uup*n_vvp; termn = n_uun*n_vvn;
+        if (termp >= termn)
+            K0(:,j) = sqrt(S(j,j)*termp)*uup/n_uup; 
+            X0(j,:) = sqrt(S(j,j)*termp)*vvp'/n_vvp;
+        else
+            K0(:,j) = sqrt(S(j,j)*termn)*uun/n_uun; 
+            X0(j,:) = sqrt(S(j,j)*termn)*vvn'/n_vvn;
+        end
+    end 
+    stats.relapproxerrorfro_init = normfro(Y,K0*X0)/normfro(Y,0);
+    fprintf('Initial rel. error ||Y-KX||/||Y||:    %10.8g\n',...
+    stats.relapproxerrorfro_init);
+    stats.relcfunctional_init = cfunctional(Y,K0,X0)/(normfro(Y,0)).^2;
+    fprintf('Rel. C-value for init. (K,X): %10.8g\n',...
+        stats.relcfunctional_init);
+end
+%Eliminating very small entries to improve numerical stability
+if min(K0(:))<param.eps_stab
+    K = K0+param.eps_stab;
+else
+    K = K0;
+end
+if min(X0(:))<param.eps_stab
+    X = X0+param.eps_stab;
+else
+    X = X0;
+end
+stats.calctime_init = etime(clock,timestarted0);
+elapsedest = zeros(3,1);
+
+%--------------------------------------------------------------------------
+%5.) Iterating K and X
+
+t=0;
+fprintf('Calculating NMF: \n');    
+timestarted = clock;
+if strcmp(stopcrit,'iterates')
+    numberit = param.maxit;
+end    
+    
+while  t<numberit  
+    K2 = K; 
+    X2 = X;
+    %---main method--------------------------------------------------------
+    %---update rules according to De Mol / Lecharlier and own ongoing
+    %---research-----------------------------------------------------------
+    KK = K.*(Y./(K*X+param.eps_stab)*X');
+    BB = repmat(transpose(sum(X,2))+0*param.omega,n,1)+...
+        param.omega*sign(K-param.eps_stab); 
+    K = 2*KK./(BB+sqrt(BB.*BB+4*param.mu*KK)+param.eps_stab);
+    %---------------------------------------------------------
+    CC = X.*(K'*(Y./(K*X+param.eps_stab)));
+    DD = repmat(transpose(sum(K,1))+0*param.lambda,1,m)+...
+        param.lambda*sign(X-param.eps_stab);   
+    X = 2*CC./(DD+sqrt(DD.*DD+4*param.nu*CC)+param.eps_stab);
+    %----------------------------------------------------------------------
+    %checking for stabilites issues arising after single entries leaving 
+    %boundaries of positive floating point scale (here only done for
+    %double format) - a better solution needs to be found!
+    if (min(min(X(:)),min(K(:)))<=10^(-319) || ...
+            max(max(X(:)),max(K(:)))>=10^319)
+        K(K<10^(-319)) = 10^(-319);
+        X(X<10^(-319)) = 10^(-319);
+        K(K>10^319) = 10^319;
+        K(K>10^319) = 10^319;
+    end
+    
+    %-----
+    t=t+1;
+    %-----
+    
+    %----------------------------------------------------------------------
+    %6.) Estimate remaining number of iterations and calc. time
+    
+    %displaying number of iterations and elapsed calculation time;
+    %also displaying remaining number of iterations and estimating the 
+    %remaining amount of calculation time
+    if t==1
+        nnns = 0; %string length; in combination with fprintf(...
+        %repmat('\b',1,nnns) ...) it is possible to overwrite some
+        %output in the command window, achieving a more compact output
+    end
+    if strcmp(stopcrit,'manual')
+        elapsed = etime(clock,timestarted);
+        fprintf([repmat('\b',1,nnns) '%5d out of %5d it.,  total ',...
+                'calc. time %8.2f s, approx. %8.2f s remaining\n'],t,...
+                numberit,elapsed,(numberit/t-1)*elapsed);
+        nnns=83; %string length
+    elseif strcmp(stopcrit,'iterates')
+        %updating time estimation vector
+        if mod(t,param.rctevsl)==0
+            rctev(1:(end-1)) = rctev(2:end);
+            rctev(end) = rdelta_it(K,K2,X,X2);
+        end
+        %estimating remaining time using a heuristic loglog approach
+        if t>=param.rctevl*param.rctevsl %minimum number of iterations 
+                                    %required first
+            if mod(t,param.rctevsl)==0
+                Rhelp = [log((t-param.rctevl*param.rctevsl+1):...
+                    param.rctevsl:t); ones(1,param.rctevl)]';
+                rega = sqrt(10^(-16)); %regularization parameter
+                mhelp = (Rhelp'*Rhelp+rega*eye(2))\(Rhelp'*log(rctev));
+                %itest: estimation of number of iterations until stopping
+                %criterion will be true
+                itest = 1+ceil(exp((log(param.stoplim)-...
+                    mhelp(2))/mhelp(1)));
+            end
+            %timest: estimation of remaining time until the stopping
+            %criterion will be true (or max. number of iterations is
+            %reached)
+            elapsedest(1:(end-1)) = elapsedest(2:end);
+            elapsedest(end) = etime(clock,timestarted);
+            if t<20
+                timeest = 1.5*(min(itest,param.maxit)-t)*...
+                    (elapsedest(end)/t);
+            else
+                timeest = (min(itest,param.maxit)-t)*...
+                    (elapsedest(end)-elapsedest(1))/(length(elapsedest)-1);
+            end
+            timeest = max(0,timeest); %if according to the iteration 
+                            %number estimator itest<t the remaining time
+                            %estimate would be negative
+        end
+        %if the iteration number estimator (and the dependent remaining
+        %time estimator) seem to be unstable/unreliable setting a
+        %counter which will prevent displaying the unreliable estimates       
+        if t<param.rctevl*param.rctevsl
+            unstable_est_counter = 0;
+        elseif (itest<0) || ((itest-t)<-10) || (itest>9999)
+            unstable_est_counter = 1;
+        else
+            unstable_est_counter = 0;
+        end        
+        %displaying number of iterations and elapsed calculation time;
+        %also trying to estimate remaining number of iterations and amount
+        %of calculation time
+        elapsed = etime(clock,timestarted);
+        if unstable_est_counter==1
+           fprintf([repmat('\b',1,nnns) '%5d calc. so far, total',...
+               'calc. time %8.2f s,',' estimation of remaining ',...
+               'iterates/time seems unstable!\n'],...
+                t,elapsed);
+           nnns = 102;
+        else       
+            if t<=param.rctevl*param.rctevsl
+                fprintf([repmat('\b',1,nnns) '%5d out of "unknown number ',...
+                    'of it.",\n total calc. time %8.2f s, "unknown amount of ',...
+                    'time remaining"\n'],t,elapsed);
+                nnns = 103;
+            else 
+                fprintf([repmat('\b',1,nnns) '%5d out of estimated %5d ',...
+                    'it. (maxit = %5d),\n total calc. time %8.2f s, ',...
+                    'approx. %8.2f s ',...
+                    'remaining\n'],t,itest,param.maxit,elapsed,timeest);    
+                nnns = 92+16+1;
+            end    
+        end
+        %checking stopping criterion
+        if t>=param.minit && ...
+                (rdelta_it(K,K2,X,X2)<param.stoplim || t>=param.maxit)
+            break;
+        end
+    end
+end
+    
+%----------------------------------------------------------------------
+%7.) Saving some stats in the struct stats
+
+stats.relapproxerrorfro_final = normfro(Y,K*X)/normfro(Y,0);
+%In general the calculation of the cost functional or even the l2
+%(frobenius-)norm between Y and the nonnegative reconstruction should not
+%be done during each update (e.g. for a different stopping criterion) since
+%it is computationally expensive for large matrices
+stats.relcfunctional_final = cfunctional(Y,K,X)/(normfro(Y,0).^2);
+stats.iter              = t;
+stats.calctime_alliter  = etime(clock,timestarted);
+stats.calctime_avgiter  = stats.calctime_alliter/t;
+stats.calctime_total    = etime(clock,timestarted0);
+
+fprintf('Final rel. error ||Y-KX||/||Y||:    %10.8g\n',...
+stats.relapproxerrorfro_final);
+fprintf('Rel. C-value for final (K,X): %10.8g\n',...
+    stats.relcfunctional_final);
+
+
+end
+
+function [U,S,V] = fsvd(A, k, i, usePowerMethod)
+% FSVD Fast Singular Value Decomposition 
+% 
+%   [U,S,V] = FSVD(A,k,i,usePowerMethod) computes the truncated singular
+%   value decomposition of the input matrix A upto rank k using i levels of
+%   Krylov method as given in [1], p. 3.
+% 
+%   If usePowerMethod is given as true, then only exponent i is used (i.e.
+%   as power method). See [2] p.9, Randomized PCA algorithm for details.
+% 
+%   [1] Halko, N., Martinsson, P. G., Shkolnisky, Y., & Tygert, M. (2010).
+%   An algorithm for the principal component analysis of large data sets.
+%   Arxiv preprint arXiv:1007.5510, 0526. Retrieved April 1, 2011, from
+%   http://arxiv.org/abs/1007.5510. 
+%   
+%   [2] Halko, N., Martinsson, P. G., & Tropp, J. A. (2009). Finding
+%   structure with randomness: Probabilistic algorithms for constructing
+%   approximate matrix decompositions. Arxiv preprint arXiv:0909.4061.
+%   Retrieved April 1, 2011, from http://arxiv.org/abs/0909.4061.
+% 
+%   See also SVD.
+% 
+%   Copyright 2011 Ismail Ari, http://ismailari.com.
+    if nargin < 3
+        i = 1;
+    end
+    % Take (conjugate) transpose if necessary. It makes H smaller thus
+    % leading the computations to be faster
+    if size(A,1) < size(A,2)
+        A = A';
+        isTransposed = true;
+    else
+        isTransposed = false;
+    end
+    n = size(A,2);
+    l = k + 2;
+    % Form a real n?l matrix G whose entries are iid Gaussian r.v.s of zero
+    % mean and unit variance
+    G = randn(n,l);
+    if nargin >= 4 && usePowerMethod
+        % Use only the given exponent
+        H = A*G;
+        for j = 2:i+1
+            H = A * (A'*H);
+        end
+    else
+        % Compute the m?l matrices H^{(0)}, ..., H^{(i)}
+        % Note that this is done implicitly in each iteration below.
+        H = cell(1,i+1);
+        H{1} = A*G;
+        for j = 2:i+1
+            H{j} = A * (A'*H{j-1});
+        end
+        % Form the m?((i+1)l) matrix H
+        H = cell2mat(H);
+    end
+    % Using the pivoted QR-decomposiion, form a real m?((i+1)l) matrix Q
+    % whose columns are orthonormal, s.t. there exists a real
+    % ((i+1)l)?((i+1)l) matrix R for which H = QR.  
+    % XXX: Buradaki column pivoting ile yap?lmayan hali.
+    [Q,~] = qr(H,0);
+    % Compute the n?((i+1)l) product matrix T = A^T Q
+    T = A'*Q;
+    % Form an SVD of T
+    [Vt, St, W] = svd(T,'econ');
+    % Compute the m?((i+1)l) product matrix
+    Ut = Q*W;
+    % Retrieve the leftmost m?k block U of Ut, the leftmost n?k block V of
+    % Vt, and the leftmost uppermost k?k block S of St. The product U S V^T
+    % then approxiamtes A. 
+    if isTransposed
+        V = Ut(:,1:k);
+        U = Vt(:,1:k);     
+    else
+        U = Ut(:,1:k);
+        V = Vt(:,1:k);
+    end
+    S = St(1:k,1:k);
+end
+
+
+
+
